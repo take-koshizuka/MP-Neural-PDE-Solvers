@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 import torch
 import random
+import wandb
 import numpy as np
 from matplotlib import pyplot as plt
 from torch import nn, optim
@@ -13,6 +14,8 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from common.utils import HDF5Dataset, GraphCreator
 from experiments.models_gnn import MP_PDE_Solver
+from experiments.models_koopman import Koopman_MP_PDE_Solver
+from experiments.models_gnn_linear import Linear_MP_PDE_Solver
 from experiments.models_cnn import BaseCNN
 from experiments.train_helper import *
 from equations.PDEs import *
@@ -64,8 +67,13 @@ def train(args: argparse,
     # Therefore in expectation the whole available training information is covered.
     for i in range(graph_creator.t_res):
         losses = training_loop(model, unrolling, args.batch_size, optimizer, loader, graph_creator, criterion, device)
-        if(i % args.print_interval == 0):
-            print(f'Training Loss (progress: {i / graph_creator.t_res:.2f}): {torch.mean(losses)}')
+        #if(i % args.print_interval == 0):
+        wandb.log(
+            {
+                "Training loss": torch.mean(losses),
+            }
+        )
+            #print(f'Training Loss (progress: {i / graph_creator.t_res:.2f}): {torch.mean(losses)}')
 
 def test(args: argparse,
          pde: PDE,
@@ -113,11 +121,15 @@ def test(args: argparse,
                                   graph_creator=graph_creator,
                                   criterion=criterion,
                                   device=device)
-
     return torch.mean(losses)
 
 
 def main(args: argparse):
+    # register config to wandb
+    proj = f"{args.experiment}-{args.base_resolution[1]}-{args.super_resolution[1]}"
+    wandb.init(project=proj, name=args.name)
+    for key, value in parser.parse_args()._get_kwargs():
+        wandb.config[key] = value
 
     device = args.device
     check_directory()
@@ -134,7 +146,7 @@ def main(args: argparse):
         pde = WE(device=device)
         assert (base_resolution[0] == 250)
         assert (base_resolution[1] == 100 or base_resolution[1] == 50 or base_resolution[1] == 40 or base_resolution[1] == 20)
-        if args.model != 'GNN':
+        if not args.model in ['GNN','LinearGNN', 'KoopmanGNN']:
             raise Exception("Only MP-PDE Solver is implemented for irregular grids so far.")
     else:
         raise Exception("Wrong experiment")
@@ -209,6 +221,20 @@ def main(args: argparse):
         model = MP_PDE_Solver(pde=pde,
                               time_window=graph_creator.tw,
                               eq_variables=eq_variables).to(device)
+    elif args.model == 'KoopmanGNN':
+        model = Koopman_MP_PDE_Solver(pde=pde, 
+                                    hidden_features=args.hidden_features,
+                                    hidden_features_rank=args.hidden_features_rank,
+                                    hidden_layer=args.hidden_layer,
+                                    time_window=graph_creator.tw,
+                                    eq_variables=eq_variables
+                                    ).to(device)
+    elif args.model == 'LinearGNN':
+        model = Linear_MP_PDE_Solver(pde=pde, 
+                                    hidden_features=args.hidden_features,
+                                    time_window=graph_creator.tw,
+                                    eq_variables=eq_variables
+                                    ).to(device)
     elif args.model == 'BaseCNN':
         model = BaseCNN(pde=pde,
                         time_window=args.time_window).to(device)
@@ -232,6 +258,7 @@ def main(args: argparse):
         train(args, pde, epoch, model, optimizer, train_loader, graph_creator, criterion, device=device)
         print("Evaluation on validation dataset:")
         val_loss = test(args, pde, model, valid_loader, graph_creator, criterion, device=device)
+        wandb.log({"val loss": val_loss})
         if(val_loss < min_val_loss):
             print("Evaluation on test dataset:")
             test_loss = test(args, pde, model, test_loader, graph_creator, criterion, device=device)
@@ -243,21 +270,30 @@ def main(args: argparse):
         scheduler.step()
 
     print(f"Test loss: {test_loss}")
+    wandb.log({"test loss": test_loss})
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train an PDE solver')
 
     # PDE
+    parser.add_argument('--name', type=str, default=None, help='wandb name')
     parser.add_argument('--device', type=str, default='cpu',
                         help='Used device')
     parser.add_argument('--experiment', type=str, default='',
                         help='Experiment for PDE solver should be trained: [E1, E2, E3, WE1, WE2, WE3]')
-
     # Model
     parser.add_argument('--model', type=str, default='GNN',
-                        help='Model used as PDE solver: [GNN, BaseCNN]')
+                        help='Model used as PDE solver: [GNN, LinearGNN, KoopmanGNN, BaseCNN]')
 
+    parser.add_argument('--hidden_features', type=int, default=128,
+                        help='Number of dimensions of hidden features')
+
+    parser.add_argument('--hidden_features_rank', type=int, default=16, 
+                        help='Rank of dimensions of hidden features')
+
+    parser.add_argument('--hidden_layer', type=int, default=6,
+                        help='Number of hidden layers')
     # Model parameters
     parser.add_argument('--batch_size', type=int, default=16,
             help='Number of samples in each minibatch')
@@ -292,3 +328,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     main(args)
+    wandb.finish()

@@ -17,6 +17,9 @@ class Swish(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(self.beta*x)
 
+def L_out(L_in, padding, dilation, kernel_size, stride):
+    return (L_in + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
+
 
 class GNN_Layer(MessagePassing):
     """
@@ -93,6 +96,7 @@ class MP_PDE_Solver(torch.nn.Module):
                  time_window: int = 25,
                  hidden_features: int = 128,
                  hidden_layer: int = 6,
+                 decoder_channels: int = 8,
                  eq_variables: dict = {}
     ):
         """
@@ -116,6 +120,7 @@ class MP_PDE_Solver(torch.nn.Module):
         self.hidden_layer = hidden_layer
         self.time_window = time_window
         self.eq_variables = eq_variables
+        self.decoder_channels = decoder_channels
 
         self.gnn_layers = torch.nn.ModuleList(modules=(GNN_Layer(
             in_features=self.hidden_features,
@@ -134,14 +139,21 @@ class MP_PDE_Solver(torch.nn.Module):
                                         )
                                )
 
+        self.encoder = nn.Sequential(
+            nn.Linear(1, self.hidden_features),
+            Swish()
+        )
+
+        self.decoder = nn.Linear(self.hidden_features, 1)
+
         self.embedding_mlp = nn.Sequential(
-            nn.Linear(self.time_window + 2 + len(self.eq_variables), self.hidden_features),
+            nn.Linear(self.hidden_features*(self.time_window + 2 + len(self.eq_variables)), self.hidden_features),
             Swish(),
             nn.Linear(self.hidden_features, self.hidden_features),
             Swish()
         )
 
-
+        """
         # Decoder CNN, maps to different outputs (temporal bundling)
         if(self.time_window==20):
             self.output_mlp = nn.Sequential(nn.Conv1d(1, 8, 15, stride=4),
@@ -158,7 +170,40 @@ class MP_PDE_Solver(torch.nn.Module):
                                             Swish(),
                                             nn.Conv1d(8, 1, 10, stride=1)
                                             )
+        """
+        if(self.time_window==20):
+            Lout1 = L_out(self.hidden_features, 0, 1, 15, 4)
+            Lout2 = L_out(Lout1, 0, 1, 10, 1)
+            self.output_mlp = nn.Sequential(nn.Conv1d(1, self.decoder_channels, 15, stride=4),
+                                            Swish(),
+                                            nn.Conv1d(self.decoder_channels, 1, 10, stride=1),
+                                            Swish(),
+                                            nn.Linear(Lout2, self.hidden_features*self.time_window),
+                                            Swish()
+                                            )
+        if (self.time_window == 25):
+            Lout1 = L_out(self.hidden_features, 0, 1, 16, 3)
+            Lout2 = L_out(Lout1, 0, 1, 14, 1)
+            self.output_mlp = nn.Sequential(nn.Conv1d(1, self.decoder_channels, 16, stride=3),
+                                            Swish(),
+                                            nn.Conv1d(self.decoder_channels, 1, 14, stride=1),
+                                            Swish(),
+                                            nn.Linear(Lout2, self.hidden_features*self.time_window),
+                                            Swish()
+                                            )
+            
 
+            
+        if(self.time_window==50):
+            Lout1 = L_out(self.hidden_features, 0, 1, 12, 2)
+            Lout2 = L_out(Lout1, 0, 1, 10, 1)
+            self.output_mlp = nn.Sequential(nn.Conv1d(1, self.decoder_channels, 12, stride=2),
+                                            Swish(),
+                                            nn.Conv1d(self.decoder_channels, 1, 10, stride=1),
+                                            Swish(),
+                                            nn.Linear(Lout2, self.hidden_features*self.time_window),
+                                            Swish()
+                                            )
     def __repr__(self):
         return f'GNN'
 
@@ -198,16 +243,18 @@ class MP_PDE_Solver(torch.nn.Module):
             variables = torch.cat((variables, data.c / self.eq_variables["c"]), -1)
 
         # Encoder and processor (message passing)
-        node_input = torch.cat((u, pos_x, variables), -1)
-        h = self.embedding_mlp(node_input)
+        node_input = torch.cat((pos_x, variables, u), -1)
+        h = self.encoder(node_input.unsqueeze(2))
+        h0 = h[:, -1, :]
+        h = self.embedding_mlp(h.reshape(-1, self.hidden_features*(self.time_window + 2 + len(self.eq_variables))))
+        
         for i in range(self.hidden_layer):
             h = self.gnn_layers[i](h, u, pos_x, variables, edge_index, batch)
-
-        # Decoder (formula 10 in the paper)
+        
         dt = (torch.ones(1, self.time_window) * self.pde.dt).to(h.device)
-        dt = torch.cumsum(dt, dim=1)
-        # [batch*n_nodes, hidden_dim] -> 1DCNN([batch*n_nodes, 1, hidden_dim]) -> [batch*n_nodes, time_window]
-        diff = self.output_mlp(h[:, None]).squeeze(1)
-        out = u[:, -1].repeat(self.time_window, 1).transpose(0, 1) + dt * diff
-
+        dt = torch.cumsum(dt, dim=1).unsqueeze(2)
+        # Decoder (formula 10 in the paper)
+        diff = self.output_mlp(h[:, None]).reshape(-1, self.time_window, self.hidden_features)
+        out = h0.repeat(self.time_window, 1).view(-1, self.time_window, self.hidden_features) + dt * diff
+        out = self.decoder(out).squeeze()
         return out

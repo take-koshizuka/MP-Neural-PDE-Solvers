@@ -84,7 +84,7 @@ class HDF5Dataset(Dataset):
             right = u_super[..., 1:3]
             u_super_padded = torch.tensor(np.concatenate((left, u_super, right), -1))
             weights = torch.tensor([[[[0.2]*5]]])
-            u_super = F.conv1d(u_super_padded, weights, stride=(1, self.ratio_nx)).squeeze().numpy()
+            u_super = F.conv2d(u_super_padded, weights, stride=(1, self.ratio_nx)).squeeze().numpy()
             x = self.x
 
             # Base resolution trajectories (numerical baseline) and equation specific parameters
@@ -101,11 +101,11 @@ class HDF5Dataset(Dataset):
             # No padding is possible due to non-periodic boundary conditions
             weights = torch.tensor([[[[1./self.ratio_nx]*self.ratio_nx]]])
             u_super = self.data[self.dataset_super][idx][::self.ratio_nt][None, None, ...]
-            u_super = F.conv1d(torch.tensor(u_super), weights, stride=(1, self.ratio_nx)).squeeze().numpy()
+            u_super = F.conv2d(torch.tensor(u_super), weights, stride=(1, self.ratio_nx)).squeeze().numpy()
 
             # To match the downprojected trajectories, also coordinates need to be downprojected
             x_super = torch.tensor(self.data[self.dataset_super].attrs['x'][None, None, None, :])
-            x = F.conv1d(x_super, weights, stride=(1, self.ratio_nx)).squeeze().numpy()
+            x = F.conv2d(x_super, weights, stride=(1, self.ratio_nx)).squeeze().numpy()
 
             # Base resolution trajectories (numerical baseline) and equation specific parameters
             u_base = self.data[self.dataset_base][idx]
@@ -160,7 +160,9 @@ class GraphCreator(nn.Module):
         """
         data = torch.Tensor()
         labels = torch.Tensor()
+        # datapoints: u(B, nt, nx)
         for (dp, step) in zip(datapoints, steps):
+            # dp: (nt, nx)
             d = dp[step - self.tw:step]
             l = dp[step:self.tw + step]
             data = torch.cat((data, d[None, :]), 0)
@@ -195,14 +197,17 @@ class GraphCreator(nn.Module):
         for b, (data_batch, labels_batch, step) in enumerate(zip(data, labels, steps)):
             u = torch.cat((u, torch.transpose(torch.cat([d[None, :] for d in data_batch]), 0, 1)), )
             y = torch.cat((y, torch.transpose(torch.cat([l[None, :] for l in labels_batch]), 0, 1)), )
+            # x, tの座標位置
             x_pos = torch.cat((x_pos, x[0]), )
             t_pos = torch.cat((t_pos, torch.ones(nx) * t[step]), )
+            # batch_index
             batch = torch.cat((batch, torch.ones(nx) * b), )
 
         # Calculate the edge_index
         if f'{self.pde}' == 'CE':
             dx = x[0][1] - x[0][0]
             radius = self.n * dx + 0.0001
+            # batchを入れることで, batchを跨いで辺は構築されない.
             edge_index = radius_graph(x_pos, r=radius, batch=batch.long(), loop=False)
         elif f'{self.pde}' == 'WE':
             edge_index = knn_graph(x_pos, k=self.n, batch=batch.long(), loop=False)

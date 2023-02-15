@@ -14,7 +14,6 @@ from datetime import datetime
 from equations.PDEs import PDE, CE, WE
 from temporal.solvers import *
 
-
 def check_files(pde: dict, modes: dict, experiment: str) -> None:
     """
     Check if data files exist and replace them if wanted.
