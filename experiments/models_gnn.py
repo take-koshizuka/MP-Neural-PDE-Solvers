@@ -139,15 +139,8 @@ class MP_PDE_Solver(torch.nn.Module):
                                         )
                                )
 
-        self.encoder = nn.Sequential(
-            nn.Linear(1, self.hidden_features),
-            Swish()
-        )
-
-        self.decoder = nn.Linear(self.hidden_features, 1)
-
         self.embedding_mlp = nn.Sequential(
-            nn.Linear(self.hidden_features*(self.time_window + 2 + len(self.eq_variables)), self.hidden_features),
+            nn.Linear(self.time_window + 2 + len(self.eq_variables), self.hidden_features),
             Swish(),
             nn.Linear(self.hidden_features, self.hidden_features),
             Swish()
@@ -178,7 +171,7 @@ class MP_PDE_Solver(torch.nn.Module):
                                             Swish(),
                                             nn.Conv1d(self.decoder_channels, 1, 10, stride=1),
                                             Swish(),
-                                            nn.Linear(Lout2, self.hidden_features*self.time_window),
+                                            nn.Linear(self.time_window),
                                             Swish()
                                             )
         if (self.time_window == 25):
@@ -188,7 +181,7 @@ class MP_PDE_Solver(torch.nn.Module):
                                             Swish(),
                                             nn.Conv1d(self.decoder_channels, 1, 14, stride=1),
                                             Swish(),
-                                            nn.Linear(Lout2, self.hidden_features*self.time_window),
+                                            nn.Linear(Lout2, self.time_window),
                                             Swish()
                                             )
             
@@ -201,7 +194,7 @@ class MP_PDE_Solver(torch.nn.Module):
                                             Swish(),
                                             nn.Conv1d(self.decoder_channels, 1, 10, stride=1),
                                             Swish(),
-                                            nn.Linear(Lout2, self.hidden_features*self.time_window),
+                                            nn.Linear(Lout2, self.time_window),
                                             Swish()
                                             )
     def __repr__(self):
@@ -243,18 +236,15 @@ class MP_PDE_Solver(torch.nn.Module):
             variables = torch.cat((variables, data.c / self.eq_variables["c"]), -1)
 
         # Encoder and processor (message passing)
-        node_input = torch.cat((pos_x, variables, u), -1)
-        h = self.encoder(node_input.unsqueeze(2))
-        h0 = h[:, -1, :]
-        h = self.embedding_mlp(h.reshape(-1, self.hidden_features*(self.time_window + 2 + len(self.eq_variables))))
-        
+        node_input = torch.cat((u, pos_x, variables), -1)
+        h = self.embedding_mlp(node_input)
         for i in range(self.hidden_layer):
             h = self.gnn_layers[i](h, u, pos_x, variables, edge_index, batch)
-        
-        dt = (torch.ones(1, self.time_window) * self.pde.dt).to(h.device)
-        dt = torch.cumsum(dt, dim=1).unsqueeze(2)
+
         # Decoder (formula 10 in the paper)
-        diff = self.output_mlp(h[:, None]).reshape(-1, self.time_window, self.hidden_features)
-        out = h0.repeat(self.time_window, 1).view(-1, self.time_window, self.hidden_features) + dt * diff
-        out = self.decoder(out).squeeze()
+        dt = (torch.ones(1, self.time_window) * self.pde.dt).to(h.device)
+        dt = torch.cumsum(dt, dim=1)
+        # [batch*n_nodes, hidden_dim] -> 1DCNN([batch*n_nodes, 1, hidden_dim]) -> [batch*n_nodes, time_window]
+        diff = self.output_mlp(h[:, None]).squeeze(1)
+        out = dt * diff
         return out
