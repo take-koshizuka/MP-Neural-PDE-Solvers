@@ -20,7 +20,6 @@ class Swish(nn.Module):
 def L_out(L_in, padding, dilation, kernel_size, stride):
     return (L_in + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
 
-
 class GNN_Layer(MessagePassing):
     """
     Message passing layer
@@ -170,9 +169,6 @@ class MP_PDE_Solver(torch.nn.Module):
             self.output_mlp = nn.Sequential(nn.Conv1d(1, self.decoder_channels, 15, stride=4),
                                             Swish(),
                                             nn.Conv1d(self.decoder_channels, 1, 10, stride=1),
-                                            Swish(),
-                                            nn.Linear(self.time_window),
-                                            Swish()
                                             )
         if (self.time_window == 25):
             Lout1 = L_out(self.hidden_features, 0, 1, 16, 3)
@@ -180,12 +176,7 @@ class MP_PDE_Solver(torch.nn.Module):
             self.output_mlp = nn.Sequential(nn.Conv1d(1, self.decoder_channels, 16, stride=3),
                                             Swish(),
                                             nn.Conv1d(self.decoder_channels, 1, 14, stride=1),
-                                            Swish(),
-                                            nn.Linear(Lout2, self.time_window),
-                                            Swish()
                                             )
-            
-
             
         if(self.time_window==50):
             Lout1 = L_out(self.hidden_features, 0, 1, 12, 2)
@@ -193,9 +184,6 @@ class MP_PDE_Solver(torch.nn.Module):
             self.output_mlp = nn.Sequential(nn.Conv1d(1, self.decoder_channels, 12, stride=2),
                                             Swish(),
                                             nn.Conv1d(self.decoder_channels, 1, 10, stride=1),
-                                            Swish(),
-                                            nn.Linear(Lout2, self.time_window),
-                                            Swish()
                                             )
     def __repr__(self):
         return f'GNN'
@@ -238,13 +226,43 @@ class MP_PDE_Solver(torch.nn.Module):
         # Encoder and processor (message passing)
         node_input = torch.cat((u, pos_x, variables), -1)
         h = self.embedding_mlp(node_input)
+        rec = self.output_mlp(h[:, None]).squeeze(1)
         for i in range(self.hidden_layer):
             h = self.gnn_layers[i](h, u, pos_x, variables, edge_index, batch)
-
+        state = h
         # Decoder (formula 10 in the paper)
-        dt = (torch.ones(1, self.time_window) * self.pde.dt).to(h.device)
-        dt = torch.cumsum(dt, dim=1)
         # [batch*n_nodes, hidden_dim] -> 1DCNN([batch*n_nodes, 1, hidden_dim]) -> [batch*n_nodes, time_window]
-        diff = self.output_mlp(h[:, None]).squeeze(1)
-        out = dt * diff
-        return out
+        out = u[:, -1].repeat(self.time_window, 1).transpose(0, 1) + \
+                self.output_mlp(h[:, None]).squeeze(1) - rec[:, -1].repeat(self.time_window, 1).transpose(0, 1) 
+        return out, rec, state
+    
+    def encode(self, data: Data, u: torch.Tensor) -> torch.Tensor:
+        u = data.x
+        # Encode and normalize coordinate information
+        pos = data.pos
+        pos_x = pos[:, 1][:, None] / self.pde.L
+        pos_t = pos[:, 0][:, None] / self.pde.tmax
+        edge_index = data.edge_index
+        batch = data.batch
+
+        # Encode equation specific parameters
+        # alpha, beta, gamma are used in E1,E2,E3 experiments
+        # bc_left, bc_right, c are used in WE1, WE2, WE3 experiments
+        variables = pos_t    # time is treated as equation variable
+        if "alpha" in self.eq_variables.keys():
+            variables = torch.cat((variables, data.alpha / self.eq_variables["alpha"]), -1)
+        if "beta" in self.eq_variables.keys():
+            variables = torch.cat((variables, data.beta / self.eq_variables["beta"]), -1)
+        if "gamma" in self.eq_variables.keys():
+            variables = torch.cat((variables, data.gamma / self.eq_variables["gamma"]), -1)
+        if "bc_left" in self.eq_variables.keys():
+            variables = torch.cat((variables, data.bc_left), -1)
+        if "bc_right" in self.eq_variables.keys():
+            variables = torch.cat((variables, data.bc_right), -1)
+        if "c" in self.eq_variables.keys():
+            variables = torch.cat((variables, data.c / self.eq_variables["c"]), -1)
+
+        # Encoder and processor (message passing)
+        node_input = torch.cat((u, pos_x, variables), -1)
+        h = self.embedding_mlp(node_input)
+        return h

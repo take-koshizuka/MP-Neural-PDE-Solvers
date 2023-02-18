@@ -17,9 +17,6 @@ class Swish(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(self.beta*x)
 
-def L_out(L_in, padding, dilation, kernel_size, stride):
-    return (L_in + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
-
 
 class GNN_Layer(MessagePassing):
     """
@@ -87,7 +84,7 @@ class GNN_Layer(MessagePassing):
             return update
 
 
-class Koopman_MP_PDE_Solver(torch.nn.Module):
+class Origin_MP_PDE_Solver(torch.nn.Module):
     """
     MP-PDE solver class
     """
@@ -95,9 +92,7 @@ class Koopman_MP_PDE_Solver(torch.nn.Module):
                  pde: PDE,
                  time_window: int = 25,
                  hidden_features: int = 128,
-                 hidden_features_rank: int = 16,
                  hidden_layer: int = 6,
-                 decoder_channels: int = 8,
                  eq_variables: dict = {}
     ):
         """
@@ -112,15 +107,13 @@ class Koopman_MP_PDE_Solver(torch.nn.Module):
             hidden_layer (int): number of hidden layers
             eq_variables (dict): dictionary of equation specific parameters
         """
-        super(Koopman_MP_PDE_Solver, self).__init__()
+        super(Origin_MP_PDE_Solver, self).__init__()
         # 1D decoder CNN is so far designed time_window = [20,25,50]
         assert(time_window == 25 or time_window == 20 or time_window == 50)
         self.pde = pde
         self.out_features = time_window
         self.hidden_features = hidden_features
-        self.hidden_features_rank = hidden_features_rank
         self.hidden_layer = hidden_layer
-        self.decoder_channels = decoder_channels
         self.time_window = time_window
         self.eq_variables = eq_variables
 
@@ -140,9 +133,6 @@ class Koopman_MP_PDE_Solver(torch.nn.Module):
                                          n_variables=len(self.eq_variables) + 1
                                         )
                                )
-        self.operator_out = nn.Sequential(
-            nn.Linear(in_features=self.hidden_features, out_features=self.hidden_features*self.hidden_features_rank, bias=True)
-        )
 
         self.embedding_mlp = nn.Sequential(
             nn.Linear(self.time_window + 2 + len(self.eq_variables), self.hidden_features),
@@ -151,32 +141,22 @@ class Koopman_MP_PDE_Solver(torch.nn.Module):
             Swish()
         )
 
-        
+
         # Decoder CNN, maps to different outputs (temporal bundling)
-        
         if(self.time_window==20):
-            Lout1 = L_out(self.hidden_features, 0, 1, 15, 4)
-            Lout2 = L_out(Lout1, 0, 1, 10, 1)
-            self.output_mlp = nn.Sequential(nn.Conv1d(1, self.decoder_channels, 15, stride=4),
+            self.output_mlp = nn.Sequential(nn.Conv1d(1, 8, 15, stride=4),
                                             Swish(),
-                                            nn.Conv1d(self.decoder_channels, 1, 10, stride=1)
+                                            nn.Conv1d(8, 1, 10, stride=1)
                                             )
         if (self.time_window == 25):
-            Lout1 = L_out(self.hidden_features, 0, 1, 16, 3)
-            Lout2 = L_out(Lout1, 0, 1, 14, 1)
-            self.output_mlp = nn.Sequential(nn.Conv1d(1, self.decoder_channels, 16, stride=3),
+            self.output_mlp = nn.Sequential(nn.Conv1d(1, 8, 16, stride=3),
                                             Swish(),
-                                            nn.Conv1d(self.decoder_channels, 1, 14, stride=1)
+                                            nn.Conv1d(8, 1, 14, stride=1)
                                             )
-            
-
-            
         if(self.time_window==50):
-            Lout1 = L_out(self.hidden_features, 0, 1, 12, 2)
-            Lout2 = L_out(Lout1, 0, 1, 10, 1)
-            self.output_mlp = nn.Sequential(nn.Conv1d(1, self.decoder_channels, 12, stride=2),
+            self.output_mlp = nn.Sequential(nn.Conv1d(1, 8, 12, stride=2),
                                             Swish(),
-                                            nn.Conv1d(self.decoder_channels, 1, 10, stride=1)
+                                            nn.Conv1d(8, 1, 10, stride=1)
                                             )
 
     def __repr__(self):
@@ -219,53 +199,15 @@ class Koopman_MP_PDE_Solver(torch.nn.Module):
 
         # Encoder and processor (message passing)
         node_input = torch.cat((u, pos_x, variables), -1)
-        h0 = self.embedding_mlp(node_input)
-        rec = self.output_mlp(h0[:, None]).squeeze(1)
-        h = h0
+        h = self.embedding_mlp(node_input)
         for i in range(self.hidden_layer):
             h = self.gnn_layers[i](h, u, pos_x, variables, edge_index, batch)
 
-        # estimate Koopman operator
-        B = self.operator_out(h).reshape(-1, self.hidden_features, self.hidden_features_rank)
-        
-        # multiply koopman operator to h
-        H = torch.matmul(torch.matmul(h0.unsqueeze(1), B), torch.transpose(B, 1, 2)).squeeze()
-        
-        state = H
         # Decoder (formula 10 in the paper)
+        dt = (torch.ones(1, self.time_window) * self.pde.dt).to(h.device)
+        dt = torch.cumsum(dt, dim=1)
         # [batch*n_nodes, hidden_dim] -> 1DCNN([batch*n_nodes, 1, hidden_dim]) -> [batch*n_nodes, time_window]
-        out = u[:, -1].repeat(self.time_window, 1).transpose(0, 1) + \
-                self.output_mlp(H[:, None]).squeeze(1) - rec[:, -1].repeat(self.time_window, 1).transpose(0, 1) 
-        
-        return out, rec, state
+        diff = self.output_mlp(h[:, None]).squeeze(1)
+        out = u[:, -1].repeat(self.time_window, 1).transpose(0, 1) + dt * diff
 
-    def encode(self, data: Data, u: torch.Tensor) -> torch.Tensor:
-        u = data.x
-        # Encode and normalize coordinate information
-        pos = data.pos
-        pos_x = pos[:, 1][:, None] / self.pde.L
-        pos_t = pos[:, 0][:, None] / self.pde.tmax
-        edge_index = data.edge_index
-        batch = data.batch
-
-        # Encode equation specific parameters
-        # alpha, beta, gamma are used in E1,E2,E3 experiments
-        # bc_left, bc_right, c are used in WE1, WE2, WE3 experiments
-        variables = pos_t    # time is treated as equation variable
-        if "alpha" in self.eq_variables.keys():
-            variables = torch.cat((variables, data.alpha / self.eq_variables["alpha"]), -1)
-        if "beta" in self.eq_variables.keys():
-            variables = torch.cat((variables, data.beta / self.eq_variables["beta"]), -1)
-        if "gamma" in self.eq_variables.keys():
-            variables = torch.cat((variables, data.gamma / self.eq_variables["gamma"]), -1)
-        if "bc_left" in self.eq_variables.keys():
-            variables = torch.cat((variables, data.bc_left), -1)
-        if "bc_right" in self.eq_variables.keys():
-            variables = torch.cat((variables, data.bc_right), -1)
-        if "c" in self.eq_variables.keys():
-            variables = torch.cat((variables, data.c / self.eq_variables["c"]), -1)
-
-        # Encoder and processor (message passing)
-        node_input = torch.cat((u, pos_x, variables), -1)
-        h = self.embedding_mlp(node_input)
-        return h
+        return out

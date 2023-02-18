@@ -159,13 +159,11 @@ class Koopman_MP_PDE_Solver(torch.nn.Module):
             self.output_mlp = nn.Sequential(nn.Conv1d(1, self.decoder_channels, 15, stride=4),
                                             Swish(),
                                             nn.Conv1d(self.decoder_channels, 1, 10, stride=1),
-                                            Swish(),
                                             )
         if (self.time_window == 25):
             self.output_mlp = nn.Sequential(nn.Conv1d(1, self.decoder_channels, 16, stride=3),
                                             Swish(),
-                                            nn.Conv1d(self.decoder_channels, 1, 14, stride=1),
-                                            Swish(),
+                                            nn.Conv1d(self.decoder_channels, 1, 14, stride=1)
                                             )
             
 
@@ -173,8 +171,7 @@ class Koopman_MP_PDE_Solver(torch.nn.Module):
         if(self.time_window==50):
             self.output_mlp = nn.Sequential(nn.Conv1d(1, self.decoder_channels, 12, stride=2),
                                             Swish(),
-                                            nn.Conv1d(self.decoder_channels, 1, 10, stride=1),
-                                            Swish(),
+                                            nn.Conv1d(self.decoder_channels, 1, 10, stride=1)
                                             )
 
     def __repr__(self):

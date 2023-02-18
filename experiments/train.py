@@ -13,6 +13,7 @@ from torch import nn, optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from common.utils import HDF5Dataset, GraphCreator
+from experiments.models_gnn_origin import Origin_MP_PDE_Solver
 from experiments.models_gnn import MP_PDE_Solver
 from experiments.models_koopman import Koopman_MP_PDE_Solver
 from experiments.models_gnn_linear import Linear_MP_PDE_Solver
@@ -66,13 +67,26 @@ def train(args: argparse,
     # Since the starting point is randomly drawn, this in expectation has every possible starting point/sample combination of the training data.
     # Therefore in expectation the whole available training information is covered.
     for i in range(graph_creator.t_res):
-        losses = training_loop(model, unrolling, args.batch_size, optimizer, loader, graph_creator, criterion, device)
+        losses = training_loop(model, unrolling, args.batch_size, optimizer, 
+                                    loader, graph_creator, criterion, 
+                                    args.lambda_rec, args.lambda_state, device)
         #if(i % args.print_interval == 0):
-        wandb.log(
-            {
-                "Training loss": torch.mean(losses),
-            }
-        )
+        if hasattr(model, 'encode'): 
+            wandb.log(
+                {
+                    "Total Training loss": torch.mean(losses['total']),
+                    "Training loss": torch.mean(losses['base']),
+                    "Reconstruction loss": torch.mean(losses['rec']),
+                    "Consistent state loss": torch.mean(losses['state'])
+                }
+            )
+        else:
+            wandb.log(
+                {
+                    "Total Training loss": torch.mean(losses['total']),
+                    "Training loss": torch.mean(losses['base'])
+                }
+            )
             #print(f'Training Loss (progress: {i / graph_creator.t_res:.2f}): {torch.mean(losses)}')
 
 def test(args: argparse,
@@ -100,8 +114,7 @@ def test(args: argparse,
         torch.Tensor: unrolled forward loss
     """
     model.eval()
-
-   # first we check the losses for different timesteps (one forward prediction array!)
+    # first we check the losses for different timesteps (one forward prediction array!)
     steps = [t for t in range(graph_creator.tw, graph_creator.t_res-graph_creator.tw + 1)]
     losses = test_timestep_losses(model=model,
                                   steps=steps,
@@ -113,15 +126,16 @@ def test(args: argparse,
 
     # next we test the unrolled losses
     losses = test_unrolled_losses(model=model,
-                                  steps=steps,
-                                  batch_size=args.batch_size,
-                                  nr_gt_steps=args.nr_gt_steps,
-                                  nx_base_resolution=args.base_resolution[1],
-                                  loader=loader,
-                                  graph_creator=graph_creator,
-                                  criterion=criterion,
-                                  device=device)
-    return torch.mean(losses)
+                                steps=steps,
+                                batch_size=args.batch_size,
+                                nr_gt_steps=args.nr_gt_steps,
+                                nx_base_resolution=args.base_resolution[1],
+                                loader=loader,
+                                graph_creator=graph_creator,
+                                criterion=criterion,
+                                device=device)
+    
+    return { key: torch.mean(losses[key]) for key in losses.keys() }
 
 
 def main(args: argparse):
@@ -221,6 +235,10 @@ def main(args: argparse):
         model = MP_PDE_Solver(pde=pde,
                               time_window=graph_creator.tw,
                               eq_variables=eq_variables).to(device)
+    elif args.model == 'originGNN':
+        model = Origin_MP_PDE_Solver(pde=pde,
+                              time_window=graph_creator.tw,
+                              eq_variables=eq_variables).to(device)
     elif args.model == 'KoopmanGNN':
         model = Koopman_MP_PDE_Solver(pde=pde, 
                                     hidden_features=args.hidden_features,
@@ -253,24 +271,32 @@ def main(args: argparse):
     min_val_loss = 10e30
     test_loss = 10e30
     criterion = torch.nn.MSELoss(reduction="sum")
+    # val_loss  = test(args, pde, model, valid_loader, graph_creator, criterion, device=device)
     for epoch in range(args.num_epochs):
         print(f"Epoch {epoch}")
         train(args, pde, epoch, model, optimizer, train_loader, graph_creator, criterion, device=device)
         print("Evaluation on validation dataset:")
-        val_loss = test(args, pde, model, valid_loader, graph_creator, criterion, device=device)
-        wandb.log({"val loss": val_loss})
-        if(val_loss < min_val_loss):
+        
+        val_loss  = test(args, pde, model, valid_loader, graph_creator, criterion, device=device)
+        if hasattr(model, 'encode'): 
+            wandb.log({ "val loss": val_loss['base'], 
+                        "val reconstruction loss": val_loss['rec'], 
+                        "val state loss": val_loss['state']})
+        else:
+            wandb.log({"val loss": val_loss['base']})
+        
+        if(val_loss['base'] < min_val_loss):
             print("Evaluation on test dataset:")
             test_loss = test(args, pde, model, test_loader, graph_creator, criterion, device=device)
             # Save model
             torch.save(model.state_dict(), save_path)
             print(f"Saved model at {save_path}\n")
-            min_val_loss = val_loss
+            min_val_loss = val_loss['base']
 
         scheduler.step()
 
-    print(f"Test loss: {test_loss}")
-    wandb.log({"test loss": test_loss})
+    print(f"Test loss: {test_loss['base']}")
+    wandb.log({"test loss": test_loss['base']})
 
 
 if __name__ == "__main__":
@@ -286,6 +312,7 @@ if __name__ == "__main__":
     parser.add_argument('--model', type=str, default='GNN',
                         help='Model used as PDE solver: [GNN, LinearGNN, KoopmanGNN, BaseCNN]')
 
+    # Model parameters
     parser.add_argument('--hidden_features', type=int, default=128,
                         help='Number of dimensions of hidden features')
 
@@ -294,7 +321,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--hidden_layer', type=int, default=6,
                         help='Number of hidden layers')
-    # Model parameters
+    
     parser.add_argument('--batch_size', type=int, default=16,
             help='Number of samples in each minibatch')
     parser.add_argument('--num_epochs', type=int, default=20,
@@ -305,6 +332,9 @@ if __name__ == "__main__":
                         default=0.4, help='multistep lr decay')
     parser.add_argument('--parameter_ablation', type=eval, default=False,
                         help='Flag for ablating MP-PDE solver without equation specific parameters')
+
+    parser.add_argument('--lambda_rec', type=float, default=0.0, help='the weight parameter of the reconstruction loss')
+    parser.add_argument('--lambda_state', type=float, default=0.0, help='the weight parameter of the consistency state loss')
 
     # Base resolution and super resolution
     parser.add_argument('--base_resolution', type=lambda s: [int(item) for item in s.split(',')],
